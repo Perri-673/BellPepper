@@ -1,5 +1,5 @@
 import torch
-from dataset import BellPepperDiseaseDataset
+from dataset import BellPepperDataset
 import sys
 from utils import save_checkpoint, load_checkpoint
 from torch.utils.data import DataLoader
@@ -10,11 +10,6 @@ from tqdm import tqdm
 from torchvision.utils import save_image
 from discriminator_model import Discriminator
 from generator_model import Generator
-from torchvision.models import inception_v3
-from scipy.linalg import sqrtm
-import numpy as np
-import torch.nn.functional as F
-from utils import calculate_fid, calculate_inception_score, get_features
 
 def train_fn(
     disc_healthy, disc_bacterial, gen_bacterial, gen_healthy, loader, opt_disc, opt_gen, l1, mse, d_scaler, g_scaler
@@ -122,8 +117,8 @@ def main():
     l1 = nn.L1Loss()
 
     # Prepare DataLoader
-    train_dataset = BellPepperDiseaseDataset(config.TRAIN_HEALTHY_DIR, config.TRAIN_BACTERIAL_DIR, transform=config.transforms)
-    val_dataset = BellPepperDiseaseDataset(config.VAL_HEALTHY_DIR, config.VAL_BACTERIAL_DIR, transform=config.transforms)
+    train_dataset = BellPepperDataset(config.TRAIN_HEALTHY_DIR, config.TRAIN_BACTERIAL_DIR, transform=config.transforms)
+    val_dataset = BellPepperDataset(config.VAL_HEALTHY_DIR, config.VAL_BACTERIAL_DIR, transform=config.transforms)
 
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
@@ -134,6 +129,7 @@ def main():
 
     # Training Loop
     for epoch in range(config.NUM_EPOCHS):
+        print("EPOCHS:",epoch)
         train_fn(
             disc_healthy,
             disc_bacterial,

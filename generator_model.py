@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, down=True, use_act=True, **kwargs):
         super().__init__()

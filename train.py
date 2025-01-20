@@ -1,18 +1,7 @@
-"""
-Training for CycleGAN with Evaluation Metrics
-"""
-
 import torch
-from dataset import BellPepperDiseaseDataset
-from utils import (
-    save_checkpoint,
-    load_checkpoint,
-    calculate_fid,
-    calculate_inception_score,
-    calculate_ssim,
-    calculate_psnr,
-    get_features,
-)
+from dataset import BellPepperDataset
+import sys
+from utils import save_checkpoint, load_checkpoint
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
@@ -21,79 +10,72 @@ from tqdm import tqdm
 from torchvision.utils import save_image
 from discriminator_model import Discriminator
 from generator_model import Generator
-from torchvision.models import inception_v3
-import numpy as np
-
 
 def train_fn(
-    disc_H,
-    disc_B,
-    gen_B,
-    gen_H,
-    loader,
-    opt_disc,
-    opt_gen,
-    l1,
-    mse,
-    d_scaler,
-    g_scaler,
-    real_loader,
-    fake_loader,
-    inception_model,
+    disc_healthy, disc_bacterial, gen_bacterial, gen_healthy, loader, opt_disc, opt_gen, l1, mse, d_scaler, g_scaler
 ):
-    H_reals = 0
-    H_fakes = 0
+    healthy_reals = 0
+    healthy_fakes = 0
     loop = tqdm(loader, leave=True)
 
     for idx, (healthy, bacterial) in enumerate(loop):
         healthy = healthy.to(config.DEVICE)
         bacterial = bacterial.to(config.DEVICE)
 
-        # Train Discriminators H and B
+        # Train Discriminators Healthy and Bacterial
         with torch.cuda.amp.autocast():
-            fake_bacterial = gen_B(healthy)
-            D_H_real = disc_H(bacterial)
-            D_H_fake = disc_H(fake_bacterial.detach())
-            H_reals += D_H_real.mean().item()
-            H_fakes += D_H_fake.mean().item()
-            D_H_real_loss = mse(D_H_real, torch.ones_like(D_H_real))
-            D_H_fake_loss = mse(D_H_fake, torch.zeros_like(D_H_fake))
-            D_H_loss = D_H_real_loss + D_H_fake_loss
+            fake_bacterial = gen_bacterial(healthy)
+            D_healthy_real = disc_healthy(bacterial)
+            D_healthy_fake = disc_healthy(fake_bacterial.detach())
+            healthy_reals += D_healthy_real.mean().item()
+            healthy_fakes += D_healthy_fake.mean().item()
+            D_healthy_real_loss = mse(D_healthy_real, torch.ones_like(D_healthy_real))
+            D_healthy_fake_loss = mse(D_healthy_fake, torch.zeros_like(D_healthy_fake))
+            D_healthy_loss = D_healthy_real_loss + D_healthy_fake_loss
 
-            fake_healthy = gen_H(bacterial)
-            D_B_real = disc_B(healthy)
-            D_B_fake = disc_B(fake_healthy.detach())
-            D_B_real_loss = mse(D_B_real, torch.ones_like(D_B_real))
-            D_B_fake_loss = mse(D_B_fake, torch.zeros_like(D_B_fake))
-            D_B_loss = D_B_real_loss + D_B_fake_loss
+            fake_healthy = gen_healthy(bacterial)
+            D_bacterial_real = disc_bacterial(healthy)
+            D_bacterial_fake = disc_bacterial(fake_healthy.detach())
+            D_bacterial_real_loss = mse(D_bacterial_real, torch.ones_like(D_bacterial_real))
+            D_bacterial_fake_loss = mse(D_bacterial_fake, torch.zeros_like(D_bacterial_fake))
+            D_bacterial_loss = D_bacterial_real_loss + D_bacterial_fake_loss
 
-            # Combine discriminator losses
-            D_loss = (D_H_loss + D_B_loss) / 2
+            # Total Discriminator Loss
+            D_loss = (D_healthy_loss + D_bacterial_loss) / 2
 
         opt_disc.zero_grad()
         d_scaler.scale(D_loss).backward()
         d_scaler.step(opt_disc)
         d_scaler.update()
 
-        # Train Generators H and B
+        # Train Generators Healthy and Bacterial
         with torch.cuda.amp.autocast():
             # Adversarial loss for both generators
-            D_H_fake = disc_H(fake_bacterial)
-            D_B_fake = disc_B(fake_healthy)
-            loss_G_B = mse(D_H_fake, torch.ones_like(D_H_fake))
-            loss_G_H = mse(D_B_fake, torch.ones_like(D_B_fake))
+            D_healthy_fake = disc_healthy(fake_bacterial)
+            D_bacterial_fake = disc_bacterial(fake_healthy)
+            loss_G_healthy = mse(D_healthy_fake, torch.ones_like(D_healthy_fake))
+            loss_G_bacterial = mse(D_bacterial_fake, torch.ones_like(D_bacterial_fake))
 
-            # Cycle consistency loss
-            cycle_healthy = gen_H(fake_bacterial)
-            cycle_bacterial = gen_B(fake_healthy)
+            # Cycle Loss
+            cycle_healthy = gen_healthy(fake_bacterial)
+            cycle_bacterial = gen_bacterial(fake_healthy)
             cycle_healthy_loss = l1(healthy, cycle_healthy)
             cycle_bacterial_loss = l1(bacterial, cycle_bacterial)
 
-            # Total generator loss
+            # Identity Loss (remove these for efficiency if you set lambda_identity=0)
+            identity_healthy = gen_healthy(healthy)
+            identity_bacterial = gen_bacterial(bacterial)
+            identity_healthy_loss = l1(healthy, identity_healthy)
+            identity_bacterial_loss = l1(bacterial, identity_bacterial)
+
+            # Total Generator Loss
             G_loss = (
-                loss_G_B
-                + loss_G_H
-                + config.LAMBDA_CYCLE * (cycle_healthy_loss + cycle_bacterial_loss)
+                loss_G_healthy
+                + loss_G_bacterial
+                + cycle_healthy_loss * config.LAMBDA_CYCLE
+                + cycle_bacterial_loss * config.LAMBDA_CYCLE
+                + identity_healthy_loss * config.LAMBDA_IDENTITY
+                + identity_bacterial_loss * config.LAMBDA_IDENTITY
             )
 
         opt_gen.zero_grad()
@@ -101,123 +83,73 @@ def train_fn(
         g_scaler.step(opt_gen)
         g_scaler.update()
 
-        loop.set_postfix(
-            D_loss=D_loss.item(),
-            G_loss=G_loss.item(),
-            H_reals=H_reals / (idx + 1),
-            H_fakes=H_fakes / (idx + 1),
-        )
-
-        # Save generated images for evaluation
+        # Save images periodically
         if idx % 200 == 0:
-            save_image(fake_bacterial * 0.5 + 0.5, f"saved_images/fake_bacterial_{idx}.png")
-            save_image(fake_healthy * 0.5 + 0.5, f"saved_images/fake_healthy_{idx}.png")
+            save_image(bacterial * 0.5 + 0.5, f"saved_images/real_bacterial_{idx}.png")
+            save_image(fake_bacterial * 0.5 + 0.5, f"saved_images/healthy_to_bacterial_{idx}.png")
+            save_image(healthy * 0.5 + 0.5, f"saved_images/real_healthy_{idx}.png")
+            save_image(fake_healthy * 0.5 + 0.5, f"saved_images/bacterial_to_healthy_{idx}.png")
 
-    # Evaluate Metrics at the end of each epoch
-    print("Calculating Evaluation Metrics...")
-    real_features = get_features(real_loader, inception_model, config.DEVICE)
-    fake_features = get_features(fake_loader, inception_model, config.DEVICE)
-    fid_score = calculate_fid(real_features, fake_features)
-    inception_score = calculate_inception_score(fake_loader, inception_model, config.DEVICE)
-
-    print(f"FID Score: {fid_score:.4f}, Inception Score: {inception_score:.4f}")
-
-    # Calculate SSIM and PSNR for a few pairs of generated and target images
-    ssim_total = 0
-    psnr_total = 0
-    num_samples = 0
-
-    for real_img, fake_img in zip(real_loader, fake_loader):
-        real_img = real_img[0].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format
-        fake_img = fake_img[0].cpu().numpy().transpose(1, 2, 0)
-
-        ssim_total += calculate_ssim(real_img, fake_img)
-        psnr_total += calculate_psnr(real_img, fake_img)
-        num_samples += 1
-
-    avg_ssim = ssim_total / num_samples
-    avg_psnr = psnr_total / num_samples
-
-    print(f"Average SSIM: {avg_ssim:.4f}, Average PSNR: {avg_psnr:.4f}")
+        loop.set_postfix(healthy_real=healthy_reals / (idx + 1), healthy_fake=healthy_fakes / (idx + 1))
 
 
 def main():
-    # Initialize models
-    disc_H = Discriminator(in_channels=3).to(config.DEVICE)
-    disc_B = Discriminator(in_channels=3).to(config.DEVICE)
-    gen_B = Generator(img_channels=3).to(config.DEVICE)
-    gen_H = Generator(img_channels=3).to(config.DEVICE)
+    # Initialize Discriminators and Generators for both healthy and bacterial
+    disc_healthy = Discriminator(in_channels=3).to(config.DEVICE)
+    disc_bacterial = Discriminator(in_channels=3).to(config.DEVICE)
+    gen_bacterial = Generator(img_channels=3, num_residuals=9).to(config.DEVICE)
+    gen_healthy = Generator(img_channels=3, num_residuals=9).to(config.DEVICE)
 
-    # Optimizers
+    # Optimizers for Discriminators and Generators
     opt_disc = optim.Adam(
-        list(disc_H.parameters()) + list(disc_B.parameters()),
+        list(disc_healthy.parameters()) + list(disc_bacterial.parameters()),
         lr=config.LEARNING_RATE,
         betas=(0.5, 0.999),
     )
     opt_gen = optim.Adam(
-        list(gen_B.parameters()) + list(gen_H.parameters()),
+        list(gen_bacterial.parameters()) + list(gen_healthy.parameters()),
         lr=config.LEARNING_RATE,
         betas=(0.5, 0.999),
     )
 
     # Loss functions
-    L1 = nn.L1Loss()
     mse = nn.MSELoss()
+    l1 = nn.L1Loss()
 
-    # Load models if necessary
-    if config.LOAD_MODEL:
-        load_checkpoint(config.CHECKPOINT_GEN_H, gen_H, opt_gen, config.LEARNING_RATE)
-        load_checkpoint(config.CHECKPOINT_GEN_B, gen_B, opt_gen, config.LEARNING_RATE)
-        load_checkpoint(config.CHECKPOINT_CRITIC_H, disc_H, opt_disc, config.LEARNING_RATE)
-        load_checkpoint(config.CHECKPOINT_CRITIC_B, disc_B, opt_disc, config.LEARNING_RATE)
+    # Prepare DataLoader
+    train_dataset = BellPepperDataset(config.TRAIN_HEALTHY_DIR, config.TRAIN_BACTERIAL_DIR, transform=config.transforms)
+    val_dataset = BellPepperDataset(config.VAL_HEALTHY_DIR, config.VAL_BACTERIAL_DIR, transform=config.transforms)
 
-    # Dataloader
-    dataset = BellPepperDiseaseDataset(
-        root_infected=config.TRAIN_BACTERIAL_DIR,
-        root_healthy=config.TRAIN_HEALTHY_DIR,
-        transform=config.transforms,
-    )
-    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
 
-    # For evaluation
-    real_loader = DataLoader(
-        BellPepperDiseaseDataset(config.VAL_HEALTHY_DIR, config.VAL_BACTERIAL_DIR, config.transforms),
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-    )
-    fake_loader = DataLoader(
-        BellPepperDiseaseDataset(config.TRAIN_BACTERIAL_DIR, config.TRAIN_HEALTHY_DIR, config.transforms),
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-    )
-    inception_model = inception_v3(pretrained=True, transform_input=False).to(config.DEVICE)
-    inception_model.fc = nn.Identity()
+    # Scalers for mixed precision training
+    d_scaler = torch.cuda.amp.GradScaler()
+    g_scaler = torch.cuda.amp.GradScaler()
 
-    # Training loop
+    # Training Loop
     for epoch in range(config.NUM_EPOCHS):
+        print("EPOCHS:",epoch)
         train_fn(
-            disc_H,
-            disc_B,
-            gen_B,
-            gen_H,
-            loader,
+            disc_healthy,
+            disc_bacterial,
+            gen_bacterial,
+            gen_healthy,
+            train_loader,
             opt_disc,
             opt_gen,
-            L1,
+            l1,
             mse,
-            torch.cuda.amp.GradScaler(),
-            torch.cuda.amp.GradScaler(),
-            real_loader,
-            fake_loader,
-            inception_model,
+            d_scaler,
+            g_scaler,
         )
+
+        # Save checkpoints periodically
         if config.SAVE_MODEL:
-            save_checkpoint(gen_H, opt_gen, filename=config.CHECKPOINT_GEN_H)
-            save_checkpoint(gen_B, opt_gen, filename=config.CHECKPOINT_GEN_B)
-            save_checkpoint(disc_H, opt_disc, filename=config.CHECKPOINT_CRITIC_H)
-            save_checkpoint(disc_B, opt_disc, filename=config.CHECKPOINT_CRITIC_B)
+            save_checkpoint(gen_healthy, opt_gen, filename=config.CHECKPOINT_GEN_HEALTHY)
+            save_checkpoint(gen_bacterial, opt_gen, filename=config.CHECKPOINT_GEN_BACTERIAL)
+            save_checkpoint(disc_healthy, opt_disc, filename=config.CHECKPOINT_CRITIC_HEALTHY)
+            save_checkpoint(disc_bacterial, opt_disc, filename=config.CHECKPOINT_CRITIC_BACTERIAL)
 
 
 if __name__ == "__main__":
